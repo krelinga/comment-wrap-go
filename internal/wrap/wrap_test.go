@@ -203,3 +203,57 @@ func Foo() {}
 		t.Errorf("expected no change for already-wrapped comment\ngot:\n%s", out)
 	}
 }
+
+// TestParagraphReflow verifies that two consecutive over-limit lines are
+// treated as a single paragraph and reflowed together, producing a better
+// result than splitting each line independently.
+func TestParagraphReflow(t *testing.T) {
+	// Each line is slightly over 60 chars.  Independent wrapping would produce
+	// 4 lines; paragraph reflow should produce 3 (or fewer).
+	src := `package p
+
+// The quick brown fox jumps over the lazy dog one two three
+// four five six seven eight nine ten eleven twelve thirteen.
+func Foo() {}
+`
+	out := mustWrap(t, src, 60)
+
+	commentLines := 0
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "// ") {
+			commentLines++
+			if len(l) > 60 {
+				t.Errorf("line over limit (%d): %q", len(l), l)
+			}
+		}
+	}
+	if commentLines >= 4 {
+		t.Errorf("paragraph reflow produced %d lines (expected < 4); paragraph was not joined:\n%s",
+			commentLines, out)
+	}
+}
+
+// TestParagraphBreakAtBlankComment verifies that a blank // line between two
+// comment groups causes them to be treated as separate paragraphs, each
+// reflowed independently, and that the blank // line is preserved verbatim.
+func TestParagraphBreakAtBlankComment(t *testing.T) {
+	src := `package p
+
+// The quick brown fox jumps over the lazy dog alpha beta gamma delta epsilon.
+//
+// The quick brown fox jumps over the lazy dog zeta eta theta iota kappa.
+func Foo() {}
+`
+	out := mustWrap(t, src, 60)
+
+	// The blank comment line must still be present.
+	if !strings.Contains(out, "\n//\n") {
+		t.Errorf("blank comment line was removed or altered:\n%s", out)
+	}
+	// No comment line should exceed the limit.
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, "// ") && len(l) > 60 {
+			t.Errorf("line over limit (%d): %q", len(l), l)
+		}
+	}
+}

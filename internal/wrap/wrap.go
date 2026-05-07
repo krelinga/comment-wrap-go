@@ -4,23 +4,30 @@ package wrap
 
 import (
 	"bytes"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"strings"
 )
 
 // File parses src as a Go source file and returns a copy where every eligible
-// // comment line that exceeds limit characters has been word-wrapped.
+// // comment paragraph that contains at least one line exceeding limit
+// characters is reflowed as a unit.
 //
 // A comment line is eligible when:
 //  1. The // marker is the first non-whitespace on its source line (i.e. it is
 //     not an inline comment after code).
-//  2. The // marker is immediately followed by a space or tab (so directives
-//     such as //go:generate, //nolint:, //go:build are left untouched).
+//  2. The // marker is immediately followed by exactly one space and then a
+//     non-whitespace character, so directives (//go:generate, //nolint:,
+//     //go:build) and indented content (godoc code blocks starting with //  )
+//     are left untouched.
 //
-// Words are never split mid-word.  If a single word is longer than the
-// available width it is placed on its own line.  Lines containing URLs that
-// would have to be split are kept intact (the URL word is never broken).
+// Consecutive eligible lines with the same source-line indent form a
+// paragraph and are reflowed together.  An empty comment line (//), a
+// directive, or any other ineligible line breaks the current paragraph.
+//
+// Words are never split mid-word.  A word longer than the available width is
+// placed on its own line without splitting.
 //
 // The returned slice is identical to src when no changes are needed.
 func File(src []byte, limit int) ([]byte, error) {
@@ -39,62 +46,35 @@ func File(src []byte, limit int) ([]byte, error) {
 	lines := srcLines(src)
 
 	for _, cg := range f.Comments {
-		for _, c := range cg.List {
-			text := c.Text // e.g. "// some words here"
-
-			// Only handle // comments.
-			if !strings.HasPrefix(text, "//") {
+		for _, para := range splitParagraphs(cg.List, lines, fset) {
+			// Only reflow if at least one line in the paragraph exceeds the limit.
+			anyOver := false
+			for _, li := range para.lineIdxs {
+				if len(lines[li]) > limit {
+					anyOver = true
+					break
+				}
+			}
+			if !anyOver {
 				continue
 			}
 
-			// Must be immediately followed by space/tab (skip directives).
-			if len(text) < 3 || (text[2] != ' ' && text[2] != '\t') {
-				continue
-			}
-
-			// Locate the source line that contains this comment.
-			pos := fset.Position(c.Pos())
-			lineIdx := pos.Line - 1 // 0-based
-			if lineIdx < 0 || lineIdx >= len(lines) {
-				continue
-			}
-			line := lines[lineIdx]
-
-			// Skip inline comments: something non-whitespace must appear
-			// before // on this line.
-			slashPos := strings.Index(line, "//")
-			if slashPos < 0 {
-				continue
-			}
-			prefix := line[:slashPos]
-			if strings.TrimSpace(prefix) != "" {
-				continue // inline comment after code
-			}
-
-			// Check length against limit (use the raw source line).
-			if len(line) <= limit {
-				continue
-			}
-
-			indent := prefix // only whitespace
-			// The comment body is everything after "// " (or "//\t").
-			body := text[3:]
-
-			// Available width for text on each continuation line is:
-			//   limit - len(indent) - len("// ")
-			avail := limit - len(indent) - 3
+			indent := para.indent
+			avail := limit - len(indent) - 3 // 3 == len("// ")
 			if avail <= 0 {
-				continue // indent alone exceeds limit; leave it alone
+				continue // indent alone exceeds limit; leave as-is
 			}
 
-			wrapped := wrapText(body, avail)
-			if len(wrapped) <= 1 {
-				// wrapText returned a single line — nothing useful to do.
-				continue
+			// Join all comment bodies into one string and reflow.
+			parts := make([]string, len(para.comments))
+			for i, c := range para.comments {
+				parts[i] = c.Text[3:] // strip "// "
 			}
+			wrapped := wrapText(strings.Join(parts, " "), avail)
 
-			// Build the replacement string.  Every line (including the first)
-			// needs the indent because the edit covers the full source line.
+			// Build replacement covering the full paragraph span.  Every
+			// output line (including the first) carries the indent because the
+			// edit covers the full source-line range.
 			var sb strings.Builder
 			for i, wl := range wrapped {
 				if i > 0 {
@@ -105,15 +85,12 @@ func File(src []byte, limit int) ([]byte, error) {
 				sb.WriteString(wl)
 			}
 
-			// Calculate byte offsets for this line in src.
-			startOff := lineStart(src, lineIdx)
-			endOff := startOff + len(line)
+			firstLI := para.lineIdxs[0]
+			lastLI := para.lineIdxs[len(para.lineIdxs)-1]
+			startOff := lineStart(src, firstLI)
+			endOff := lineStart(src, lastLI) + len(lines[lastLI])
 
-			edits = append(edits, edit{
-				start: startOff,
-				end:   endOff,
-				text:  sb.String(),
-			})
+			edits = append(edits, edit{start: startOff, end: endOff, text: sb.String()})
 		}
 	}
 
@@ -132,6 +109,69 @@ func File(src []byte, limit int) ([]byte, error) {
 		out = applyEdit(out, e.start, e.end, e.text)
 	}
 	return out, nil
+}
+
+// paragraph is a sequence of consecutive eligible // comment lines that share
+// the same source-line indent.  It is the unit of reflow.
+type paragraph struct {
+	comments []*ast.Comment
+	lineIdxs []int
+	indent   string
+}
+
+// splitParagraphs partitions a CommentGroup's list into paragraphs.
+//
+// A comment is eligible when:
+//   - Its text is "// " followed by a non-whitespace character (exactly one
+//     space after //).  This excludes directives (//go:build, //nolint:…),
+//     blank comment lines (//), and godoc code blocks (//  indented).
+//   - Its source line has only whitespace before // (not an inline comment).
+//
+// Consecutive eligible comments with the same indent are grouped; any
+// ineligible comment resets the current paragraph.
+func splitParagraphs(list []*ast.Comment, lines []string, fset *token.FileSet) []paragraph {
+	var result []paragraph
+	var cur *paragraph
+
+	for _, c := range list {
+		text := c.Text
+
+		// Must be "// x" where x is non-whitespace — exactly one space after //.
+		if len(text) < 4 || text[2] != ' ' || text[3] == ' ' || text[3] == '\t' {
+			cur = nil
+			continue
+		}
+
+		pos := fset.Position(c.Pos())
+		lineIdx := pos.Line - 1 // 0-based
+		if lineIdx < 0 || lineIdx >= len(lines) {
+			cur = nil
+			continue
+		}
+		line := lines[lineIdx]
+
+		// Skip inline comments (non-whitespace before // on the same line).
+		slashPos := strings.Index(line, "//")
+		if slashPos < 0 || strings.TrimSpace(line[:slashPos]) != "" {
+			cur = nil
+			continue
+		}
+		indent := line[:slashPos]
+
+		if cur != nil && cur.indent == indent {
+			cur.comments = append(cur.comments, c)
+			cur.lineIdxs = append(cur.lineIdxs, lineIdx)
+		} else {
+			result = append(result, paragraph{
+				comments: []*ast.Comment{c},
+				lineIdxs: []int{lineIdx},
+				indent:   indent,
+			})
+			cur = &result[len(result)-1]
+		}
+	}
+
+	return result
 }
 
 // wrapText wraps text into lines of at most width runes, splitting only at

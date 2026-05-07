@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: 'Semantic release name (e.g., v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Validate release name format
+        run: |
+          RELEASE_NAME="${{ github.event.inputs.release_name }}"
+          if [[ ! "$RELEASE_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Release name must follow semantic versioning format (v1.0.0)"
+            echo "Provided: $RELEASE_NAME"
+            exit 1
+          fi
+          echo "Release name validation passed: $RELEASE_NAME"
+
+      - name: Check if tag already exists
+        run: |
+          RELEASE_NAME="${{ github.event.inputs.release_name }}"
+          if git rev-parse "$RELEASE_NAME" >/dev/null 2>&1; then
+            echo "Error: Tag $RELEASE_NAME already exists"
+            exit 1
+          fi
+          echo "Tag $RELEASE_NAME does not exist, proceeding with creation"
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Install Go dependencies
+        run: go mod download
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Create and push tag
+        run: |
+          RELEASE_NAME="${{ github.event.inputs.release_name }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_NAME" -m "Release $RELEASE_NAME"
+          git push origin "$RELEASE_NAME"
+          echo "Successfully created and pushed tag: $RELEASE_NAME"
+
+      - name: Export tagged version with go list -m
+        run: |
+          GOPROXY=proxy.golang.org go list -m "github.com/${{ github.repository_owner }}/$(basename ${{ github.repository }})@${{ github.event.inputs.release_name }}"
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.release_name }}
+          name: Release ${{ github.event.inputs.release_name }}
+          generate_release_notes: true
+          body: |
+            ## Changes
+            See the [commits](https://github.com/${{ github.repository }}/commits/${{ github.event.inputs.release_name }}) for details.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release summary
+        run: |
+          RELEASE_NAME="${{ github.event.inputs.release_name }}"
+          REPO="${{ github.repository }}"
+          GH_RELEASE_URL="https://github.com/$REPO/releases/tag/$RELEASE_NAME"
+
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Release tag **$RELEASE_NAME** has been successfully created." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- [GitHub Release]($GH_RELEASE_URL)" >> $GITHUB_STEP_SUMMARY

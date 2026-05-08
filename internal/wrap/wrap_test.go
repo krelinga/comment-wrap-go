@@ -257,3 +257,108 @@ func Foo() {}
 		}
 	}
 }
+
+// TestBulletItemWrapping verifies that a single bullet list item longer than
+// the limit is wrapped with aligned continuation lines.
+func TestBulletItemWrapping(t *testing.T) {
+	src := `package p
+
+// Items:
+//
+//   - The quick brown fox jumps over the lazy dog and then keeps running far away.
+func Foo() {}
+`
+	out := mustWrap(t, src, 60)
+
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "//") && len(l) > 60 {
+			t.Errorf("line over limit (%d): %q", len(l), l)
+		}
+	}
+	// The bullet marker must still appear on the first item line.
+	if !strings.Contains(out, "//   - ") {
+		t.Errorf("bullet marker missing in output:\n%s", out)
+	}
+	// Continuation line must be indented to align with text (5 spaces after //).
+	if !strings.Contains(out, "//     ") {
+		t.Errorf("continuation indent missing in output:\n%s", out)
+	}
+}
+
+// TestNumberedItemWrapping verifies that a numbered list item longer than the
+// limit is wrapped with aligned continuation lines.
+func TestNumberedItemWrapping(t *testing.T) {
+	src := `package p
+
+// Steps:
+//
+//  1. The quick brown fox jumps over the lazy dog and then keeps running away.
+func Foo() {}
+`
+	out := mustWrap(t, src, 60)
+
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "//") && len(l) > 60 {
+			t.Errorf("line over limit (%d): %q", len(l), l)
+		}
+	}
+	// The numbered marker must still appear.
+	if !strings.Contains(out, "//  1. ") {
+		t.Errorf("numbered marker missing in output:\n%s", out)
+	}
+}
+
+// TestListItemsNotMerged verifies that two adjacent bullet items are each
+// reflowed independently and their text is never merged together.
+func TestListItemsNotMerged(t *testing.T) {
+	src := `package p
+
+// Items:
+//
+//   - Alpha item: the quick brown fox jumps over the lazy dog runs far away.
+//   - Beta item: the quick brown fox jumps over the lazy dog runs far away too.
+func Foo() {}
+`
+	out := mustWrap(t, src, 60)
+
+	if !strings.Contains(out, "Alpha item") || !strings.Contains(out, "Beta item") {
+		t.Errorf("item text was lost in output:\n%s", out)
+	}
+	// Both markers must still be present (items not merged).
+	markerCount := strings.Count(out, "//   - ")
+	if markerCount < 2 {
+		t.Errorf("expected 2 bullet markers, got %d; items may have been merged:\n%s",
+			markerCount, out)
+	}
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "//") && len(l) > 60 {
+			t.Errorf("line over limit (%d): %q", len(l), l)
+		}
+	}
+}
+
+// TestListItemWithContinuation verifies that a bullet item that is already
+// split across a marker line and a continuation line is correctly rejoined and
+// reflowed.
+func TestListItemWithContinuation(t *testing.T) {
+	// Two-line item: marker line + one continuation line.
+	src := `package p
+
+// Items:
+//
+//   - The quick brown fox jumps over the lazy dog and then
+//     keeps running far away across the fields.
+func Foo() {}
+`
+	out := mustWrap(t, src, 60)
+
+	for _, l := range strings.Split(out, "\n") {
+		if strings.Contains(l, "//") && len(l) > 60 {
+			t.Errorf("line over limit (%d): %q", len(l), l)
+		}
+	}
+	// The bullet marker must still be present.
+	if !strings.Contains(out, "//   - ") {
+		t.Errorf("bullet marker missing in output:\n%s", out)
+	}
+}

@@ -60,29 +60,64 @@ func File(src []byte, limit int) ([]byte, error) {
 			}
 
 			indent := para.indent
-			avail := limit - len(indent) - 3 // 3 == len("// ")
-			if avail <= 0 {
-				continue // indent alone exceeds limit; leave as-is
-			}
 
-			// Join all comment bodies into one string and reflow.
-			parts := make([]string, len(para.comments))
-			for i, c := range para.comments {
-				parts[i] = c.Text[3:] // strip "// "
-			}
-			wrapped := wrapText(strings.Join(parts, " "), avail)
-
-			// Build replacement covering the full paragraph span.  Every
-			// output line (including the first) carries the indent because the
-			// edit covers the full source-line range.
+			var wrapped []string
 			var sb strings.Builder
-			for i, wl := range wrapped {
-				if i > 0 {
-					sb.WriteByte('\n')
+
+			if para.isList {
+				// List item: first line has the marker; continuation lines are
+				// indented to the same column as the text start.
+				marker := para.markerStr
+				continuationPad := strings.Repeat(" ", len(marker))
+				avail := limit - len(indent) - 2 - len(marker) // 2 == len("//")
+				if avail <= 0 {
+					continue
 				}
-				sb.WriteString(indent)
-				sb.WriteString("// ")
-				sb.WriteString(wl)
+
+				// Collect body text from each line, stripping the marker/padding.
+				parts := make([]string, len(para.comments))
+				for i, c := range para.comments {
+					parts[i] = c.Text[2+len(marker):] // strip "//" + marker/continuationPad
+				}
+				wrapped = wrapText(strings.Join(parts, " "), avail)
+
+				for i, wl := range wrapped {
+					if i > 0 {
+						sb.WriteByte('\n')
+					}
+					sb.WriteString(indent)
+					sb.WriteString("//")
+					if i == 0 {
+						sb.WriteString(marker)
+					} else {
+						sb.WriteString(continuationPad)
+					}
+					sb.WriteString(wl)
+				}
+			} else {
+				avail := limit - len(indent) - 3 // 3 == len("// ")
+				if avail <= 0 {
+					continue // indent alone exceeds limit; leave as-is
+				}
+
+				// Join all comment bodies into one string and reflow.
+				parts := make([]string, len(para.comments))
+				for i, c := range para.comments {
+					parts[i] = c.Text[3:] // strip "// "
+				}
+				wrapped = wrapText(strings.Join(parts, " "), avail)
+
+				// Build replacement covering the full paragraph span.  Every
+				// output line (including the first) carries the indent because the
+				// edit covers the full source-line range.
+				for i, wl := range wrapped {
+					if i > 0 {
+						sb.WriteByte('\n')
+					}
+					sb.WriteString(indent)
+					sb.WriteString("// ")
+					sb.WriteString(wl)
+				}
 			}
 
 			firstLI := para.lineIdxs[0]
@@ -113,22 +148,27 @@ func File(src []byte, limit int) ([]byte, error) {
 
 // paragraph is a sequence of consecutive eligible // comment lines that share
 // the same source-line indent.  It is the unit of reflow.
+//
+// For list items (isList == true), markerStr holds the text between "//" and
+// the item body on the first line, e.g. "   - " or "  1. ".  Continuation
+// lines of the same item use the same number of spaces (no marker).
 type paragraph struct {
-	comments []*ast.Comment
-	lineIdxs []int
-	indent   string
+	comments  []*ast.Comment
+	lineIdxs  []int
+	indent    string
+	isList    bool
+	markerStr string // non-empty only when isList == true
 }
 
 // splitParagraphs partitions a CommentGroup's list into paragraphs.
 //
-// A comment is eligible when:
-//   - Its text is "// " followed by a non-whitespace character (exactly one
-//     space after //).  This excludes directives (//go:build, //nolint:…),
-//     blank comment lines (//), and godoc code blocks (//  indented).
-//   - Its source line has only whitespace before // (not an inline comment).
+// Plain paragraphs require "// " (one space) followed by a non-whitespace
+// character on a pure comment line; consecutive such lines with the same
+// source-line indent are grouped.
 //
-// Consecutive eligible comments with the same indent are grouped; any
-// ineligible comment resets the current paragraph.
+// List-item paragraphs are recognised by listItemMarker.  Each item starts a
+// fresh paragraph; continuation lines (same indent depth, no marker) are
+// appended to it.  Any ineligible line ends the current paragraph.
 func splitParagraphs(list []*ast.Comment, lines []string, fset *token.FileSet) []paragraph {
 	var result []paragraph
 	var cur *paragraph
@@ -136,12 +176,7 @@ func splitParagraphs(list []*ast.Comment, lines []string, fset *token.FileSet) [
 	for _, c := range list {
 		text := c.Text
 
-		// Must be "// x" where x is non-whitespace — exactly one space after //.
-		if len(text) < 4 || text[2] != ' ' || text[3] == ' ' || text[3] == '\t' {
-			cur = nil
-			continue
-		}
-
+		// Resolve source-line indent first — needed for both paths.
 		pos := fset.Position(c.Pos())
 		lineIdx := pos.Line - 1 // 0-based
 		if lineIdx < 0 || lineIdx >= len(lines) {
@@ -158,7 +193,35 @@ func splitParagraphs(list []*ast.Comment, lines []string, fset *token.FileSet) [
 		}
 		indent := line[:slashPos]
 
-		if cur != nil && cur.indent == indent {
+		// --- List item path ---
+		if markerStr, ok := listItemMarker(text); ok {
+			// Each list item always starts a new paragraph.
+			result = append(result, paragraph{
+				comments:  []*ast.Comment{c},
+				lineIdxs:  []int{lineIdx},
+				indent:    indent,
+				isList:    true,
+				markerStr: markerStr,
+			})
+			cur = &result[len(result)-1]
+			continue
+		}
+
+		if cur != nil && cur.isList && isListContinuation(text, cur.markerStr) {
+			cur.comments = append(cur.comments, c)
+			cur.lineIdxs = append(cur.lineIdxs, lineIdx)
+			continue
+		}
+
+		// --- Plain paragraph path ---
+
+		// Must be "// x" where x is non-whitespace — exactly one space after //.
+		if len(text) < 4 || text[2] != ' ' || text[3] == ' ' || text[3] == '\t' {
+			cur = nil
+			continue
+		}
+
+		if cur != nil && !cur.isList && cur.indent == indent {
 			cur.comments = append(cur.comments, c)
 			cur.lineIdxs = append(cur.lineIdxs, lineIdx)
 		} else {
@@ -172,6 +235,94 @@ func splitParagraphs(list []*ast.Comment, lines []string, fset *token.FileSet) [
 	}
 
 	return result
+}
+
+// listItemMarker reports whether text (a full comment text like "//   - foo")
+// begins with a Go doc comment list marker.  If so, it returns the marker
+// string — everything in text after "//" up to and including the space/tab
+// that follows the marker character(s), e.g. "   - " or "  1. ".
+func listItemMarker(text string) (markerStr string, ok bool) {
+	if len(text) < 2 || text[:2] != "//" {
+		return "", false
+	}
+	rest := text[2:] // everything after "//"
+
+	// Count leading spaces (at least one required to distinguish from a plain
+	// paragraph line which has exactly one space).
+	i := 0
+	for i < len(rest) && rest[i] == ' ' {
+		i++
+	}
+	if i < 1 || i >= len(rest) {
+		return "", false
+	}
+
+	// Bullet marker: one of - * + •
+	ch := rest[i]
+	if ch == '-' || ch == '*' || ch == '+' || ch == '\xe2' {
+		// Handle Unicode bullet • (U+2022, UTF-8: 0xE2 0x80 0xA2)
+		markerEnd := i + 1
+		if ch == '\xe2' {
+			if len(rest) < i+3 || rest[i+1] != '\x80' || rest[i+2] != '\xa2' {
+				return "", false
+			}
+			markerEnd = i + 3
+		}
+		if markerEnd >= len(rest) || (rest[markerEnd] != ' ' && rest[markerEnd] != '\t') {
+			return "", false
+		}
+		return rest[:markerEnd+1], true
+	}
+
+	// Numbered marker: one or more ASCII digits followed by '.' or ')'
+	if ch >= '0' && ch <= '9' {
+		j := i
+		for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+			j++
+		}
+		if j >= len(rest) {
+			return "", false
+		}
+		punct := rest[j]
+		if punct != '.' && punct != ')' {
+			return "", false
+		}
+		markerEnd := j + 1
+		if markerEnd >= len(rest) || (rest[markerEnd] != ' ' && rest[markerEnd] != '\t') {
+			return "", false
+		}
+		return rest[:markerEnd+1], true
+	}
+
+	return "", false
+}
+
+// isListContinuation reports whether text is a continuation line of a list
+// item whose marker string is markerStr.  A continuation line has the same
+// number of characters as markerStr (all spaces) after "//", followed by
+// non-whitespace content, and is not itself a list marker.
+func isListContinuation(text, markerStr string) bool {
+	if len(text) < 2+len(markerStr)+1 {
+		return false
+	}
+	if text[:2] != "//" {
+		return false
+	}
+	prefix := text[2 : 2+len(markerStr)]
+	for _, b := range []byte(prefix) {
+		if b != ' ' && b != '\t' {
+			return false
+		}
+	}
+	// The character immediately after the prefix must be non-whitespace
+	// (otherwise it could be a blank comment or deeper-indented code block).
+	next := text[2+len(markerStr)]
+	if next == ' ' || next == '\t' {
+		return false
+	}
+	// Must not itself be a new list item.
+	_, isItem := listItemMarker(text)
+	return !isItem
 }
 
 // wrapText wraps text into lines of at most width runes, splitting only at

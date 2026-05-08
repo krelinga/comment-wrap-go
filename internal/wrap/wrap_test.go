@@ -189,18 +189,40 @@ func Foo() {}
 	}
 }
 
-// TestAlreadyWrapped verifies that a comment that is already properly wrapped
-// is returned unchanged.
+// TestAlreadyWrapped verifies that a paragraph which is already optimally
+// wrapped across multiple lines is returned byte-for-byte identical.
 func TestAlreadyWrapped(t *testing.T) {
+	// Two lines that fill near the limit and cannot be joined without exceeding
+	// it; after reflow they produce the exact same two lines.
+	src := `package p
+
+// The quick brown fox jumps over the lazy dog alpha beta.
+// The quick brown fox jumps over the lazy dog gamma delta.
+func Foo() {}
+`
+	out := mustWrap(t, src, 60)
+	if out != src {
+		t.Errorf("expected no change for already-optimal paragraph\ngot:\n%s", out)
+	}
+}
+
+// TestPlainParagraphConsolidation verifies that two consecutive short // lines
+// that fit on a single line are joined into one.
+func TestPlainParagraphConsolidation(t *testing.T) {
 	src := `package p
 
 // Short line one.
 // Short line two.
 func Foo() {}
 `
+	want := `package p
+
+// Short line one. Short line two.
+func Foo() {}
+`
 	out := mustWrap(t, src, 60)
-	if out != src {
-		t.Errorf("expected no change for already-wrapped comment\ngot:\n%s", out)
+	if out != want {
+		t.Errorf("expected short lines to be consolidated\ngot:\n%s\nwant:\n%s", out, want)
 	}
 }
 
@@ -337,28 +359,44 @@ func Foo() {}
 	}
 }
 
-// TestListItemWithContinuation verifies that a bullet item that is already
-// split across a marker line and a continuation line is correctly rejoined and
-// reflowed.
+// TestListItemWithContinuation verifies that a bullet item split across a
+// marker line and a continuation line is collapsed when the joined body fits
+// on a single line.
 func TestListItemWithContinuation(t *testing.T) {
-	// Two-line item: marker line + one continuation line.
 	src := `package p
 
 // Items:
 //
-//   - The quick brown fox jumps over the lazy dog and then
-//     keeps running far away across the fields.
+//   - Short item.
+//     And more text.
+func Foo() {}
+`
+	want := `package p
+
+// Items:
+//
+//   - Short item. And more text.
 func Foo() {}
 `
 	out := mustWrap(t, src, 60)
-
-	for _, l := range strings.Split(out, "\n") {
-		if strings.Contains(l, "//") && len(l) > 60 {
-			t.Errorf("line over limit (%d): %q", len(l), l)
-		}
+	if out != want {
+		t.Errorf("expected continuation to be joined\ngot:\n%s\nwant:\n%s", out, want)
 	}
-	// The bullet marker must still be present.
-	if !strings.Contains(out, "//   - ") {
-		t.Errorf("bullet marker missing in output:\n%s", out)
+}
+
+// TestListItemAlreadyOptimal verifies that a multi-line list item which is
+// already optimally wrapped (body cannot fit in fewer lines) is left unchanged.
+func TestListItemAlreadyOptimal(t *testing.T) {
+	src := `package p
+
+// Items:
+//
+//   - The quick brown fox jumps over the lazy dog alpha.
+//     The quick brown fox jumps over the lazy dog beta.
+func Foo() {}
+`
+	out := mustWrap(t, src, 60)
+	if out != src {
+		t.Errorf("expected no change for already-optimal list item\ngot:\n%s", out)
 	}
 }
